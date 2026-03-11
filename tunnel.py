@@ -172,12 +172,24 @@ class TunnelClient:
 
     def _delete_tunnels_by_host(self, host: str) -> None:
         """Delete all tunnel routes matching the given host."""
-        matching = self._find_tunnels_by_host(host)
+        max_iterations = 50  # Prevent infinite loop
+        iteration = 0
 
-        for route in matching:
+        while iteration < max_iterations:
+            matching = self._find_tunnels_by_host(host)
+            if not matching:
+                break
+
+            iteration += 1
+            route = matching[0]
             route_id = route.get("@id", "")
-            self.logger.info(f"Removing existing tunnel for {host}: {route_id}")
-            self._delete_tunnel_by_id(route_id)
+            self.logger.info(f"Removing existing tunnel for {host}: {route_id} ({iteration}/{len(matching)} remaining)")
+            if not self._delete_tunnel_by_id(route_id):
+                self.logger.warning(f"Failed to delete tunnel {route_id}, skipping remaining")
+                break
+
+        if iteration >= max_iterations:
+            self.logger.warning(f"Reached max iterations ({max_iterations}) cleaning up tunnels for {host}")
 
     def _check_host_taken_by_other(self, host: str) -> bool:
         """Check if another tunnel (different ID) is using this host."""
@@ -192,7 +204,10 @@ class TunnelClient:
 
     def _create_tunnel(self) -> bool:
         """Create tunnel route in Caddy. Replaces existing if same host."""
-        # First, delete all existing tunnels with same host
+        # First, try to delete our own tunnel by direct ID (fast path)
+        self._delete_tunnel_by_id(self.tunnel_id)
+
+        # Then clean up any remaining tunnels with the same host
         self.logger.debug(f"Checking for existing tunnels with host: {self.host}")
         self._delete_tunnels_by_host(self.host)
 
