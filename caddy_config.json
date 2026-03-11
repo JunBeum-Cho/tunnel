@@ -3,9 +3,11 @@
     "http": {
       "servers": {
         "sirtunnel": {
-          "listen": [":443"],
-          "routes": [
-          ]
+          "listen": [
+            ":443",
+            ":80"
+          ],
+          "routes": []
         }
       }
     }
