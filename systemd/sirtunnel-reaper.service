@@ -1,0 +1,43 @@
+# Server-side route reaper. Exactly one of these per server.
+#
+# Reaping used to happen inside every tunnel client: each one probed and
+# deleted every other client's routes on its own 30s timer, so N tunnels meant
+# N sweeps, N times the admin-API load, and any client could delete a healthy
+# route belonging to another on the strength of one 2s probe. This unit does
+# the same job once, and only removes a route after --strikes consecutive
+# failed probes.
+#
+# Install (on the SirTunnel server):
+#
+#   sudo cp tunnel_cleanup.py /usr/local/bin/tunnel_cleanup.py
+#   sudo chmod +x /usr/local/bin/tunnel_cleanup.py
+#   sudo cp systemd/sirtunnel-reaper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sirtunnel-reaper
+#
+# A cron job works just as well, since strike counts live in the state file:
+#   * * * * * /usr/local/bin/tunnel_cleanup.py reap >/dev/null
+
+[Unit]
+Description=SirTunnel route reaper
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tunnel_cleanup.py reap --watch 30 --strikes 3
+Restart=always
+RestartSec=10
+
+# The state file holds strike counts between passes.
+Environment=SIRTUNNEL_STATE_FILE=/var/lib/sirtunnel/reaper.json
+StateDirectory=sirtunnel
+
+# Only talks to the loopback admin API and probes loopback ports.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
