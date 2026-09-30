@@ -27,6 +27,9 @@ HEALTH_REQUEST_TIMEOUT = 5
 CLEANUP_LOCK_TIMEOUT = 5
 PORT_WAIT_ATTEMPTS = 5
 PORT_FAILURE_LIMIT = 3
+# Caddy durations are nanoseconds in JSON. Retain upgraded connections briefly
+# when a different tunnel causes the shared HTTP configuration to be reloaded.
+STREAM_CLOSE_DELAY = 300 * 1_000_000_000
 
 
 class HostConflict(RouteError):
@@ -58,6 +61,7 @@ class TunnelClient:
         self._cleaned_up = False
         self._registered = False
         self._owns_port_lease = False
+        self._stream_close_delay_supported = True
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
             format="%(asctime)s [%(levelname)s] %(message)s",
@@ -72,6 +76,8 @@ class TunnelClient:
         # A signal may arrive while the main thread holds a mutation lock.
         # Cleanup runs after the operation unwinds, never inside the handler.
         self.logger.info("Received %s, shutting down", signal.Signals(signum).name)
+        # autossh treats a successful remote exit as an intentional shutdown.
+        self.exit_code = 128 + signum
         self.running = False
         self._stop_event.set()
 
@@ -82,14 +88,17 @@ class TunnelClient:
         return api_request(method, url, data, timeout)
 
     def _get_route_config(self):
+        proxy = {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": f"127.0.0.1:{self.port}"}],
+        }
+        if self._stream_close_delay_supported:
+            proxy["stream_close_delay"] = STREAM_CLOSE_DELAY
         return {
             "@id": self.tunnel_id,
             "group": self.owner,
             "match": [{"host": [self.host]}],
-            "handle": [{
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": f"127.0.0.1:{self.port}"}],
-            }],
+            "handle": [proxy],
         }
 
     def _route_is_ours(self, route):
@@ -133,13 +142,29 @@ class TunnelClient:
                 # Holding the port lease rules out another current client on
                 # this port, even when a stale route's port has been reused.
                 # Remove old hostname aliases and duplicates in the same PATCH.
-            kept.append(self._get_route_config())
+            desired = self._get_route_config()
+            kept.append(desired)
             if self._stop_event.is_set():
                 return False
             # A request can time out after Caddy committed it. Cleanup must
             # still check whether we own a route in that case.
             self._registered = True
-            write_routes(self.caddy_api, kept, etag)
+            # Retrying a request that already committed must not reload Caddy
+            # again or move an unchanged route to the end of the array.
+            if len(kept) != len(routes) or desired not in routes:
+                try:
+                    write_routes(self.caddy_api, kept, etag)
+                except RouteError as exc:
+                    # Older Caddy releases reject this field before committing
+                    # the configuration. Preserve registration compatibility;
+                    # timeouts, ETag conflicts and other errors still propagate.
+                    error = str(exc).replace('\\"', '"')
+                    if not self._stream_close_delay_supported or 'unknown field "stream_close_delay"' not in error:
+                        raise
+                    self._stream_close_delay_supported = False
+                    kept[-1] = self._get_route_config()
+                    self.logger.warning("Caddy lacks stream_close_delay; upgrade via ./install.sh to protect WebSockets during route updates")
+                    write_routes(self.caddy_api, kept, etag)
             self.logger.info("Tunnel registered: https://%s -> 127.0.0.1:%s", self.host, self.port)
             return True
 

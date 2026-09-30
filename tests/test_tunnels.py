@@ -5,6 +5,7 @@ from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import signal
 from pathlib import Path
 import sys
 import tempfile
@@ -37,6 +38,8 @@ class AdminAPI:
         self.writes = 0
         self.read_error = None
         self.mutate_before_write = None
+        self.reject_stream_close_delay = False
+        self.stream_rejections = 0
         self.mutex = threading.Lock()
         api = self
 
@@ -75,6 +78,13 @@ class AdminAPI:
                         api.version += 1
                     if self.headers.get("If-Match") != f'"{ROUTES_PATH} {api.version}"':
                         self.reply(412, "configuration changed")
+                        return
+                    if api.reject_stream_close_delay and any(
+                        "stream_close_delay" in handle
+                        for entry in body for handle in entry.get("handle", [])
+                    ):
+                        api.stream_rejections += 1
+                        self.reply(400, {"error": 'json: unknown field "stream_close_delay"'})
                         return
                     api.routes = body
                     api.version += 1
@@ -134,6 +144,39 @@ class TunnelFailures(unittest.TestCase):
         self.assertFalse(errors)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual({r["@id"] for r in self.api.routes}, {c.tunnel_id for c in clients})
+
+    def test_repeated_claim_does_not_reload_or_reorder_routes(self):
+        client = self.client()
+        client._claim_host()
+        self.api.routes.append(route("two.example.com", 9002))
+        original = deepcopy(self.api.routes)
+        client._claim_host()
+        self.assertEqual(self.api.writes, 1)
+        self.assertEqual(self.api.routes, original)
+
+    def test_legacy_caddy_keeps_registration_and_other_routes(self):
+        self.api.reject_stream_close_delay = True
+        self.api.routes = [route("two.example.com", 9002)]
+        original = deepcopy(self.api.routes)
+        client = self.client()
+        self.assertTrue(client._claim_host())
+        self.assertEqual(self.api.stream_rejections, 1)
+        self.assertEqual(self.api.writes, 1)
+        self.assertEqual(self.api.routes, original + [client._get_route_config()])
+        self.assertNotIn("stream_close_delay", self.api.routes[-1]["handle"][0])
+        client._claim_host()
+        self.assertEqual(self.api.stream_rejections, 1)
+        self.assertEqual(self.api.writes, 1)
+
+    def test_remote_signals_exit_with_failure_for_autossh(self):
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signum=signum):
+                client = self.client()
+                client.running = True
+                client._signal_handler(signum, None)
+                self.assertFalse(client.running)
+                self.assertTrue(client._stop_event.is_set())
+                self.assertEqual(client.exit_code, 128 + signum)
 
     def test_live_hostname_conflict_preserves_existing_service(self):
         self.api.routes = [route()]

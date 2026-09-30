@@ -4,14 +4,17 @@
 import argparse
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -19,6 +22,7 @@ import time
 
 from tunnel_common import (
     DEFAULT_CADDY_API, SERVER_NAME, LockTimeout, RouteError, api_request, file_lock,
+    route_hosts,
 )
 from tunnel_cleanup import REAPER_LOCK_FILE, dedupe, reap
 
@@ -27,8 +31,8 @@ ROOT = Path(__file__).resolve().parent
 
 def positive_env(name, default, integer=False):
     value = (int if integer else float)(os.environ.get(name, default))
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
+    if value <= 0 or not math.isfinite(value):
+        raise ValueError(f"{name} must be positive and finite")
     return value
 
 
@@ -171,6 +175,57 @@ class Supervisor:
             self.process.kill()
             self.process.wait(timeout=5)
 
+    def _serving_https(self):
+        """Require a TLS handshake and HTTP response, not just an open port.
+
+        Use saved route hosts for certificate selection and an unmatched Host
+        for Caddy's own response. An unhealthy upstream must not restart every
+        other service. Keep the complete fallback probe within three seconds.
+        """
+        if not self.was_ready or self.process.poll() is not None:
+            return False
+        try:
+            path = self.autosave if self.autosave and self.autosave.exists() else self.settings.config
+            server = json.loads(path.read_text())["apps"]["http"]["servers"][SERVER_NAME]
+            hosts = list(dict.fromkeys(host for route in server.get("routes", []) for host in route_hosts(route)))
+            listeners = server.get("listen", [])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["http/1.1"])
+        deadline = time.monotonic() + 3
+        for listener in listeners:
+            endpoint = listener[4:] if listener.startswith("tcp/") else listener
+            address, separator, port = endpoint.rpartition(":")
+            if not separator or not port.isdigit():
+                continue
+            address = address.strip("[]")
+            if address in ("", "0.0.0.0"):
+                address = "127.0.0.1"
+            elif address == "::":
+                address = "::1"
+            for host in hosts:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    with socket.create_connection((address, int(port)), timeout=remaining) as raw:
+                        raw.settimeout(max(0.01, deadline - time.monotonic()))
+                        with context.wrap_socket(raw, server_hostname=host) as conn:
+                            conn.settimeout(max(0.01, deadline - time.monotonic()))
+                            conn.sendall(b"HEAD / HTTP/1.1\r\nHost: health.sirtunnel.invalid\r\nConnection: close\r\n\r\n")
+                            response = http.client.HTTPResponse(conn)
+                            try:
+                                response.begin()
+                                return 100 <= response.status <= 599 and self.process.poll() is None
+                            finally:
+                                response.close()
+                except (OSError, ValueError, http.client.HTTPException):
+                    continue
+        return False
+
     def _reaper_loop(self):
         state_file = str(self.settings.runtime / "reaper.json")
         while not self.stop_event.is_set():
@@ -286,10 +341,12 @@ class Supervisor:
                             self.error = res.error
                             self.log.warning("Caddy health check failed (%s/%s): %s", failures, self.settings.health_failures, res.error)
                             if failures >= self.settings.health_failures:
-                                self.ready = False
-                                self.api_ready.clear()
-                                self.log.error("Caddy remained unresponsive; restarting")
-                                self._stop_caddy()
+                                if self._serving_https():
+                                    self.error = "Admin API unavailable; HTTPS still serving; restart deferred"
+                                    self.log.warning(self.error)
+                                else:
+                                    self.log.error("Caddy remained unresponsive; restarting")
+                                    self._stop_caddy()
                     self.stop_event.wait(0.2)
             finally:
                 self.stop_event.set()

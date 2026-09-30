@@ -57,7 +57,12 @@ The supervisor:
 
 - Restarts Caddy after an exit, with a retry delay increasing from 1 to 30 seconds.
 - Checks the admin API every 10 seconds, with a 3-second request timeout. Six
-  consecutive failures trigger a restart; an isolated timeout does not.
+  consecutive failures trigger a check of the HTTPS listener. If it completes
+  a TLS handshake and returns an HTTP response, Caddy keeps serving and the
+  restart is deferred. If both checks fail, Caddy is restarted. A listening TCP
+  port alone does not count as a healthy server. During an admin-only outage,
+  `status` reports `ready: false` and explains the deferred restart in `error`;
+  route reaping pauses until the API recovers.
 - Runs one reaper every 30 seconds, removing routes only after three consecutive
   failed port checks and a final check immediately before removal.
 - Restores Caddy's saved dynamic configuration on restart, using `--resume`.
@@ -162,6 +167,21 @@ removes routes whose ID, owner, hostname and port all match the exiting process.
 The reaper rechecks ownership after probes; new sessions do not inherit an old
 session's failed-probe counts.
 
+An unchanged registration is not written again. New routes use a five-minute
+`stream_close_delay`, so adding or removing another tunnel does not immediately
+close existing WebSockets during a Caddy configuration reload. This is a bounded
+grace period: an upgraded connection still using the old configuration can close
+after five minutes, and a Caddy process restart interrupts it. WebSocket clients
+should reconnect. Old Caddy versions that reject this option still register
+routes but log a warning; run `./install.sh` to get the supported version. Existing
+SSH sessions must reconnect to load the new route option. See
+[Caddy's streaming connection behavior](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#streaming).
+
+The remote tunnel process exits with a nonzero status on SIGHUP/SIGTERM/SIGINT,
+so `autossh` can reconnect after a remote termination rather than treating the
+exit as a successful end of the session. The client must still run `autossh`
+with the options shown above.
+
 The `sirtunnel` server listens on HTTPS port 443 only. Caddy creates the HTTP
 redirect server when a hostname is registered. See
 [Caddy's automatic HTTPS behavior](https://caddyserver.com/docs/automatic-https).
@@ -212,7 +232,8 @@ The first command checks concurrency, owner-safe cleanup, API failures, reused
 ports and reaper state. The second additionally uses a real Caddy instance on
 isolated high ports to check HTTPS forwarding, HTTP redirects, detached startup,
 duplicate starts, SIGHUP, SIGKILL recovery with saved routes, watchdog recovery
-from SIGSTOP, and shutdown. It needs `openssl` and does not touch production
-listeners or certificate storage.
+from SIGSTOP, WebSocket continuity across route registration/removal, an admin-only
+failure with HTTPS still serving, and shutdown. It needs `openssl` and does not
+touch production listeners or certificate storage.
 
 Upstream project: https://github.com/anderspitman/SirTunnel
