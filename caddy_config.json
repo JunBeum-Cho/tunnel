@@ -4,8 +4,7 @@
       "servers": {
         "sirtunnel": {
           "listen": [
-            ":443",
-            ":80"
+            ":443"
           ],
           "routes": []
         }
