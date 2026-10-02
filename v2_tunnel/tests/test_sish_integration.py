@@ -140,7 +140,7 @@ class SishIntegrationTests(unittest.TestCase):
                         SISH_RUNTIME_DIR=str(self.directory), SISH_BIND_ADDRESS="127.0.0.1",
                         SISH_DOMAIN="example.test", SISH_HTTP_PORT=str(self.http),
                         SISH_HTTPS_PORT=str(self.https), SISH_SSH_PORT=str(self.ssh),
-                        SISH_HTTPS_ONDEMAND="false", SISH_VERIFY_DNS="false",
+                        SISH_HTTPS_ONDEMAND="false", SISH_VERIFY_DNS="true",
                         SISH_HEALTH_INTERVAL="0.3", SISH_HEALTH_FAILURES="2", SISH_START_TIMEOUT="10")
         log = (self.directory / "sish-{}.log".format(len(self.logs))).open("w+")
         self.logs.append(log)
@@ -271,6 +271,29 @@ class SishIntegrationTests(unittest.TestCase):
         process = self.forward("first.example.test", self.app("first"), password="wrong-password")
         self.assertNotEqual(process.wait(timeout=10), 0)
         self.assertEqual(self.request("first.example.test")[0], 404)
+
+    def test_health_checks_keep_real_connection_errors_visible(self):
+        log = self.directory / "server.log"
+        # Ignore the standalone startup probe, which runs outside the supervisor.
+        time.sleep(1)
+        offset = log.stat().st_size
+        time.sleep(1)
+        quiet = log.read_text()[offset:]
+        self.assertNotIn("cannot find connection for host: localhost", quiet)
+        self.assertNotIn("Accepted SSH connection for:", quiet)
+        self.assertNotIn("TLS handshake error", quiet)
+        self.assertNotIn("SSH connection could not be established", quiet)
+
+        self.forward("first.example.test", self.app("first"), password="wrong-password").wait(timeout=10)
+        wait_until(lambda: "Login attempt:" in log.read_text()[offset:])
+        self.assertIn("Accepted SSH connection for:", log.read_text()[offset:])
+        context = ssl._create_unverified_context()
+        with socket.create_connection(("127.0.0.1", self.https), timeout=3) as connection:
+            with self.assertRaises(ssl.SSLError):
+                context.wrap_socket(connection, server_hostname="unregistered.invalid")
+        wait_until(lambda: "TLS handshake error" in log.read_text()[offset:])
+        self.forward("first.example.test", self.apps[0])
+        self.route_ready("first.example.test", "first")
 
     def test_large_upload_and_response_after_five_seconds(self):
         self.forward("first.example.test", self.app("first"))

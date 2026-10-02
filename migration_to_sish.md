@@ -4,7 +4,7 @@
 
 이 안을 기준으로 [`v2_tunnel/`](v2_tunnel/README.md)에 별도 실행 구성을 구현하고, ourmemories Dockerfile의 기존 연결 명령을 주석으로 보관한 뒤 sish 연결 명령을 적용했다. 현재 VPS 실행 방식은 **Docker와 Docker Compose 없이 `sh run_server.sh`로 공식 sish 바이너리를 직접 실행하는 방식**이다. 실제 실행·복구 절차는 `v2_tunnel/README.md`를 따른다.
 
-macOS arm64에서 공식 sish v2.23.0 바이너리와 실제 `sh run_server.sh`를 사용하는 격리된 로컬 통합 테스트 13개가 모두 통과했다. 도메인 라우팅·연결 정리·긴 요청·WebSocket과 시작·종료·재시작·watchdog 복구를 검증했다. 실제 VPS 배포, Docker 이미지 빌드·실행, 공인 인증서 발급 및 기존 구성과의 처리 성능 비교는 아직 수행하지 않았다.
+macOS arm64에서 공식 sish v2.23.0 바이너리와 실제 `sh run_server.sh`를 사용하는 격리된 로컬 통합 테스트 14개가 모두 통과했다. 도메인 라우팅·연결 정리·긴 요청·WebSocket과 시작·종료·재시작·watchdog 복구를 검증했다. 상태 확인에서 발생하는 로그는 제외하고 실제 접속 오류는 보존하는 것도 확인했다. DNS 검증 옵션은 운영 설정과 같은 `true`로 시험했다. 실제 VPS 배포, Docker 이미지 빌드·실행, 공인 인증서 발급 및 기존 구성과의 처리 성능 비교는 아직 수행하지 않았다.
 
 ## 유지할 운영 방식
 
@@ -58,7 +58,7 @@ VPS에는 기존처럼 Python 3(3.8 이상)를 사용한다. 추가 Python 패�
 ```text
 tunnel/v2_tunnel/
 ├── run_server.sh       # POSIX sh 진입점
-├── install.sh          # 바이너리 준비·Linux의 낮은 포트 바인딩 권한 부여
+├── install.sh          # 바이너리 준비·Linux 포트 권한·UFW/firewalld 허용 규칙 설정
 ├── server.py           # 백그라운드 실행·시작 확인·정지·재시작·watchdog
 ├── config.py           # .env와 환경변수에서 sish 옵션 구성
 ├── install_sish.py     # 공식 바이너리 다운로드·SHA256 검증
@@ -96,7 +96,7 @@ SISH_SSH_PORT=2222
 
 ```sh
 sh run_server.sh check
-sh install.sh            # 다운로드·검증, Linux에서는 낮은 포트 바인딩 권한 부여
+sh install.sh            # 다운로드·검증, Linux 포트 권한과 방화벽 허용 규칙 설정
 ../run_server.sh stop     # 기존 Caddy의 80/443 해제
 sh run_server.sh
 sh run_server.sh status
@@ -104,7 +104,9 @@ sh run_server.sh status
 
 첫 시작 시 Linux/macOS의 amd64·arm64를 구분해 공식 릴리스를 내려받고 체크섬을 검증한다. 이후에는 저장된 바이너리를 직접 실행한다. 기본 실행은 터미널과 분리되며, 시작 준비를 확인한 뒤 반환한다. `stop`, `restart`, `logs`, `--foreground`도 같은 sh 진입점으로 사용할 수 있다.
 
-기존 Caddy 설치 스크립트처럼 Linux의 `sh install.sh`는 sish에 `CAP_NET_BIND_SERVICE`를 부여한다. 이 단계에서만 `sudo` 인증이 필요하며, 이후에는 같은 일반 사용자로 `sh run_server.sh`를 실행한다. 실행 파일 교체 후에는 설치 단계를 다시 수행한다. 권한이 없으면 시작 전 검사에서 오류와 설치 안내를 바로 표시한다.
+기존 Caddy 설치 스크립트처럼 Linux의 `sh install.sh`는 sish에 `CAP_NET_BIND_SERVICE`를 부여한다. `setcap`이 없으면 Debian/Ubuntu에서 `libcap2-bin`을 자동 설치한다. 서버와 같은 설정 파서로 HTTP·HTTPS·SSH 포트를 읽어 UFW와 실행 중인 firewalld에 TCP 허용 규칙도 추가한다. 기본값은 `80/443/2222`이며 사용자 지정 포트도 반영된다. 반복 실행해도 규칙이 중복되지 않고, 비활성 UFW는 활성화 상태를 유지한다. firewalld의 활성 zone들과 기본 zone에는 현재 규칙과 영구 규칙을 함께 적용한다.
+
+패키지·권한·방화벽 설정에는 `sudo` 인증이 필요하며, 이후에는 같은 일반 사용자로 `sh run_server.sh`를 실행한다. 설정 적용에 실패하면 설치 명령도 실패로 종료한다. 실행 파일 교체 후에는 설치 단계를 다시 수행한다. 권한이 없으면 시작 전 검사에서 오류와 설치 안내를 바로 표시한다. 설치 출력에는 listen 주소, 설정된 포트와 별도의 Vultr Firewall Group에서 필요한 규칙도 표시한다.
 
 ### 도메인 등록과 HTTPS
 
@@ -194,5 +196,7 @@ ENV TUNNEL_USER=linuxuser
 | 인증서 발급 | Caddy가 등록된 도메인의 인증서 관리 | 첫 HTTPS 접속 시 발급 |
 
 sish watchdog은 개별 앱이나 TLS 인증서·HTTPS 응답 전체를 검사하지 않는다. 공인 인증서 발급과 서비스 Docker의 실제 자동 재접속은 VPS에서 추가 확인해야 한다. 기존 Caddy의 인증서 저장소를 자동으로 가져오는 기능은 포함하지 않는다.
+
+내부 준비 확인과 외부 접속 가능 여부는 따로 확인한다. 서비스 Docker 호스트에서 VPS의 TCP `2222`에 접속할 수 있어야 도메인이 등록된다. `sh install.sh`가 VPS의 UFW/firewalld 규칙을 추가하며, 직접 구성한 nftables/iptables 규칙은 별도로 확인한다. Vultr Firewall을 사용하는 경우 인스턴스에 연결된 Firewall Group에도 같은 포트를 허용해야 한다. Vultr 계정 방화벽은 VPS 내부 명령으로 변경되지 않으므로 필요한 규칙을 설치 마지막에 안내한다. `cannot find connection for host`가 나오면 인증서 설정을 바꾸기 전에 SSH 연결과 `forwarding started` 로그를 확인한다. 자세한 점검 명령은 `v2_tunnel/README.md`에 있다.
 
 이 변경의 주된 이점은 직접 유지하던 도메인 등록·연결 정리를 sish에 맡기는 것이다. 처리 성능을 이유로 교체하려면 같은 VPS에서 지연 시간, 업로드 처리량, CPU·메모리 사용량, 연결 복구 시간을 별도로 비교해야 한다.

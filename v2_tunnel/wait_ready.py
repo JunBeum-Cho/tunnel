@@ -2,6 +2,7 @@
 """Wait for HTTP, the HTTPS listener and the SSH banner without issuing a cert."""
 
 import argparse
+import contextlib
 import http.client
 import socket
 import sys
@@ -16,19 +17,36 @@ def address(published):
     return host, int(port)
 
 
-def probe(http_address, https_address, ssh_address):
+@contextlib.contextmanager
+def probe_connection(address, on_connection):
+    if on_connection is None:
+        with socket.create_connection(address, timeout=1) as connection:
+            yield connection
+        return
+    family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as connection:
+        connection.settimeout(1)
+        connection.bind((address[0], 0))
+        # Register before connecting so the log reader can identify this probe.
+        on_connection(connection.getsockname()[:2])
+        connection.connect(address)
+        yield connection
+
+
+def probe(http_address, https_address, ssh_address, on_connection=None):
     connection = http.client.HTTPConnection(*http_address, timeout=1)
     try:
-        connection.request("GET", "/", headers={"Host": "localhost"})
+        # Go handles OPTIONS * without looking up an unregistered tunnel host.
+        connection.request("OPTIONS", "*", headers={"Host": "localhost"})
         response = connection.getresponse()
         if response.status >= 500:
             raise OSError("HTTP returned {}".format(response.status))
     finally:
         connection.close()
 
-    with socket.create_connection(https_address, timeout=1):
+    with probe_connection(https_address, on_connection):
         pass
-    with socket.create_connection(ssh_address, timeout=1) as connection:
+    with probe_connection(ssh_address, on_connection) as connection:
         if not connection.recv(255).startswith(b"SSH-2.0-"):
             raise OSError("SSH banner is not ready")
 

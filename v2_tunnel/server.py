@@ -10,6 +10,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -84,6 +85,8 @@ class Supervisor:
         self.error = "starting"
         self.restarts = 0
         self.started = time.monotonic()
+        self.probe_sources = {}
+        self.probe_lock = threading.Lock()
         self.log = logging.getLogger("sish.server")
         self.log.setLevel(logging.INFO)
         formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -103,9 +106,30 @@ class Supervisor:
                 "uptime_seconds": int(time.monotonic() - self.started), "error": self.error,
                 "log": str(self.settings.runtime / "server.log")}
 
+    def remember_probe(self, address):
+        host, port = address
+        endpoint = "[{}]:{}".format(host, port) if ":" in host else "{}:{}".format(host, port)
+        now = time.monotonic()
+        with self.probe_lock:
+            self.probe_sources = {key: expiry for key, expiry in self.probe_sources.items() if expiry > now}
+            self.probe_sources[endpoint] = now + 15
+
+    def is_probe_log(self, line):
+        if not any(message in line for message in (
+            "Accepted SSH connection for:", "SSH connection could not be established",
+            "Error closing connection: close tcp", "http: TLS handshake error from",
+        )):
+            return False
+        endpoints = re.findall(r"(?:\[[0-9a-fA-F:]+\]|(?:\d{1,3}\.){3}\d{1,3}):\d+", line)
+        now = time.monotonic()
+        with self.probe_lock:
+            return any(self.probe_sources.get(endpoint, 0) > now for endpoint in endpoints)
+
     def pipe_logs(self, process):
         try:
             for line in process.stdout:
+                if self.is_probe_log(line):
+                    continue
                 self.log.info("[sish %s] %s", process.pid,
                               line.rstrip().replace(self.settings.password, "[redacted]"))
         finally:
@@ -187,7 +211,7 @@ class Supervisor:
                             if time.monotonic() < next_probe:
                                 continue
                             try:
-                                probe(*settings.addresses())
+                                probe(*settings.addresses(), on_connection=self.remember_probe)
                                 self.ready = self.process.poll() is None
                                 self.error = "" if self.ready else "sish exited"
                                 self.was_ready = self.was_ready or self.ready

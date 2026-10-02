@@ -41,7 +41,7 @@ SISH_CERTIFICATE_EMAIL=
 
 ```sh
 sh run_server.sh check
-sh install.sh  # 바이너리 준비, Linux에서는 80/443 바인딩 권한 부여
+sh install.sh  # 바이너리 준비, Linux 포트 권한 및 방화벽 허용 규칙 설정
 ```
 
 기본 `80/443`은 기존 Caddy와 공유할 수 없으므로, 실제 도메인으로 시험할 때는 기존 터널 서버를 종료한 다음 새 서버를 시작한다. 이 전환 중에는 서비스 연결이 끊기는 시간이 발생한다.
@@ -52,9 +52,13 @@ sh run_server.sh
 sh run_server.sh status
 ```
 
-VPS 방화벽에서 외부 HTTP/HTTPS용 `80/443`과 서비스 Docker의 연결용 TCP `2222`가 열려 있어야 한다. 서비스 도메인의 DNS는 이 VPS를 가리켜야 한다. 기존 도메인을 그대로 사용한다면 DNS를 바꿀 필요는 없다.
+`sh install.sh`는 `.env`와 환경변수에서 서버와 동일하게 포트를 읽고 Linux의 UFW 및 실행 중인 firewalld에 인바운드 TCP 허용 규칙을 추가한다. 기본값은 HTTP `80`, HTTPS `443`, 서비스 Docker 연결용 SSH `2222`이며, 포트를 바꿨다면 바뀐 값으로 설정한다. 다시 실행해도 같은 허용 규칙을 중복 추가하지 않는다. UFW가 비활성화돼 있으면 규칙만 저장하고 활성화 상태는 유지한다. firewalld는 활성 zone들과 기본 zone에 현재 적용 규칙과 영구 규칙을 모두 추가한다.
 
-기존 Caddy의 `install.sh`처럼, Linux에서는 `sh install.sh`가 sish 실행 파일에 `CAP_NET_BIND_SERVICE`를 부여한다. 일반 사용자로 실행하면 이 단계에서만 `sudo` 인증이 필요하며, 이후 시작·상태 확인·종료는 같은 일반 사용자로 `sh run_server.sh`를 사용한다. `setcap`이 없다면 Debian/Ubuntu에서 `sudo apt-get install libcap2-bin`으로 설치한다. 실행 파일을 교체하거나 새 버전으로 업데이트하면 새 실행 파일에도 이 설치 단계를 다시 수행한다. 높은 포트의 로컬 테스트에는 권한 부여 없이 `sh run_server.sh install`만 사용해도 된다.
+UFW나 실행 중인 firewalld가 없는 경우에는 그 상태를 출력한다. 직접 구성한 nftables/iptables 규칙이 있다면 같은 포트를 허용해야 한다. **Vultr 계정에 연결된 Firewall Group은 VPS 내부 방화벽과 별도**이므로, 사용 중인 그룹에도 같은 TCP 포트의 인바운드 허용 규칙이 필요하다. 설치 마지막에 필요한 포트와 source 설정을 영어로 안내한다. IPv4 전체 접속을 허용할 때 source는 `0.0.0.0/0`이며, SSH 포트는 서비스 Docker 호스트의 공인 IP로 좁힐 수도 있다. IPv6로 접속한다면 해당 IPv6 규칙도 필요하다. [Vultr 방화벽 규칙](https://docs.vultr.com/products/network/firewall-groups/management/rules).
+
+서비스 도메인의 DNS는 이 VPS를 가리켜야 한다. 기존 도메인을 그대로 사용한다면 DNS를 바꿀 필요는 없다. 설치 출력에 listen 주소도 표시하며, loopback 주소를 지정했다면 외부 Docker가 연결할 수 없다는 안내를 출력한다. 운영용 기본값은 `SISH_BIND_ADDRESS=0.0.0.0`이다.
+
+기존 Caddy의 `install.sh`처럼, Linux에서는 `sh install.sh`가 sish 실행 파일에 `CAP_NET_BIND_SERVICE`를 부여한다. 일반 사용자로 실행하면 패키지·권한·방화벽 설정 단계에서 `sudo` 인증이 필요하며, 이후 시작·상태 확인·종료는 같은 일반 사용자로 `sh run_server.sh`를 사용한다. `setcap`이 없으면 Debian/Ubuntu의 `apt-get`으로 `libcap2-bin`을 자동 설치한다. 패키지 설치나 권한·방화벽 규칙 추가에 실패하면 설치 명령도 실패로 종료한다. 실행 파일을 교체하거나 새 버전으로 업데이트하면 새 실행 파일에도 이 설치 단계를 다시 수행한다. 높은 포트의 로컬 테스트에는 권한·방화벽 변경 없이 `sh run_server.sh install`만 사용해도 된다.
 
 `bind: permission denied`가 나타나면 `sh run_server.sh stop`, `sh install.sh`, `sh run_server.sh` 순서로 실행한다. 실행 전에 바인딩 권한이 없다고 확인되면 즉시 실패 메시지를 표시하며, 시작 제한 시간 동안 재시작을 반복하지 않는다.
 
@@ -106,6 +110,21 @@ curl -i https://api.ourmemories.kr/
 
 첫 번째 요청은 HTTPS로 이동해야 한다. 두 번째는 해당 앱의 응답을 반환해야 한다. 앱의 `/` 경로가 404를 반환하는 경우에는 실제 정상 동작하는 API 경로를 사용한다. 등록되지 않은 도메인은 앱으로 전달되지 않는다.
 
+### Docker 연결 후 `cannot find connection for host`가 나올 때
+
+이 메시지는 해당 요청 시점에 도메인의 터널이 등록되지 않았다는 뜻이다. 자동 인증서 발급도 등록된 터널을 확인한 뒤 허용하므로, 먼저 SSH 연결·도메인 등록을 확인한다.
+
+기본 설정에서는 서비스 Docker가 VPS의 TCP `2222`에 연결한다. VPS 내부에서 `sish is ready`가 나와도 외부 방화벽이 이 포트를 막을 수 있다. Docker를 실행하는 호스트에서 확인한다.
+
+```sh
+nc -vz -w 5 158.247.248.94 2222
+docker logs --tail 100 ourmemories-server
+```
+
+연결이 시간 초과라면 VPS에서 `sh install.sh`를 다시 실행해 포트 권한과 UFW/firewalld 규칙을 적용한다. `ss -ltn 'sport = :2222'`로 `0.0.0.0:2222` 또는 외부 접속을 받는 주소에 리스닝 중인지 확인한다. Vultr Firewall을 사용하는 VPS는 인스턴스에 연결된 Firewall Group의 인바운드 IPv4 규칙에도 TCP `2222`를 허용해야 한다. 접속 출발지는 서비스 Docker 호스트의 공인 IP이며, 어느 네트워크에서든 연결하려면 source를 `0.0.0.0/0`으로 지정한다. [Ubuntu 방화벽 문서](https://documentation.ubuntu.com/server/how-to/security/firewalls/index.html), [Vultr 방화벽 규칙](https://docs.vultr.com/products/network/firewall-groups/management/rules).
+
+접속은 되지만 `Permission denied`가 나온다면 VPS `.env`와 서비스 Docker에 전달한 `SSH_PASSWORD`가 같은지 확인한다. `deploy:docker`는 실행한 셸의 `SSH_PASSWORD`를 build arg로 전달한다. 정상 등록 시 VPS 로그에 `forwarding started: ...api.ourmemories.kr...`가 나타난다. 방화벽을 수정한 뒤 `autossh` 재시도를 기다리거나 `docker restart ourmemories-server`로 즉시 재연결할 수 있다.
+
 ## 실행과 상태 확인
 
 ```sh
@@ -116,7 +135,7 @@ sh run_server.sh restart     # 서버 재시작, SSH 연결은 재연결 필요
 sh run_server.sh stop        # 정지, 인증서와 서버 키는 보관
 sh run_server.sh check       # 설정 확인, 다운로드나 서버 실행은 하지 않음
 sh run_server.sh install     # 공식 바이너리만 준비, 서버 실행은 하지 않음
-sh install.sh               # 바이너리 준비와 Linux 낮은 포트 권한 부여
+sh install.sh               # 바이너리 준비, Linux 포트 권한과 방화벽 허용 규칙 설정
 sh run_server.sh --foreground
 ```
 
@@ -125,6 +144,8 @@ sh run_server.sh --foreground
 같은 도메인을 두 서비스가 동시에 등록하면 두 번째 등록을 실패시킨다. 기존 서비스의 등록은 유지한다. 연결 종료가 확인되면 해당 도메인을 정리하고, `autossh`가 재연결하면 다시 등록한다.
 
 관리 프로세스는 sish가 종료되면 다시 실행한다. 정상 상태에서는 기본 5초마다 HTTP 응답, HTTPS 포트, SSH 배너를 검사하고, 실패하면 빠르게 재확인한다. 연속 3회 실패하면 sish를 종료하고 다시 실행한다. 초기 기동 중에는 시작 제한 시간 동안 기다린다. 설정은 `SISH_HEALTH_INTERVAL`, `SISH_HEALTH_FAILURES`, `SISH_START_TIMEOUT`으로 조절한다.
+
+HTTP 상태 확인에는 도메인 등록이 필요 없는 `OPTIONS *` 요청을 사용한다. 관리 프로세스가 직접 만든 HTTPS·SSH 검사 연결의 접속 및 종료 로그는 연결 주소와 포트로 식별해 제외한다. 서비스의 인증 실패, 미등록 도메인의 TLS 오류, 실제 서비스 연결 로그는 계속 기록한다.
 
 이 watchdog은 터널 서버의 준비 상태를 검사한다. 개별 앱이나 HTTPS 인증서·TLS 응답 전체를 검사하는 것은 아니므로 특정 앱의 장애를 이유로 모든 터널을 재시작하지 않는다. VPS 재부팅 후 자동 시작이나 관리 프로세스 자체의 강제 종료 복구가 필요하면 기존처럼 VPS의 부팅·프로세스 관리자가 `sh run_server.sh`를 호출하도록 연결한다.
 
@@ -164,12 +185,13 @@ SISH_TEST_BIN=/path/to/sish \
     python3 -m unittest discover -s tests -v
 ```
 
-macOS arm64에서 공식 sish v2.23.0과 실제 sh 진입점으로 통합 테스트 13개가 모두 통과했다. 검증한 항목은 다음과 같다.
+macOS arm64에서 공식 sish v2.23.0과 실제 sh 진입점으로 통합 테스트 14개가 모두 통과했다. DNS 검증 옵션도 운영 설정과 같은 `true`로 시험했다. 검증한 항목은 다음과 같다.
 
 - 서로 다른 루트에 속한 도메인과 루트 도메인의 앱 선택, Host·HTTPS 헤더·경로 보존, HTTP→HTTPS 리다이렉트
 - 중복 도메인 등록 거절과 기존 서비스 유지
 - 연결 종료 후 도메인 정리와 재연결 등록
 - 잘못된 비밀번호의 연결 거절
+- 정기 상태 확인 로그 제외와 실제 인증 실패·TLS 오류·서비스 등록 로그 보존
 - 11MiB 업로드 내용 보존과 6초 걸리는 응답
 - 다른 서비스의 등록·종료 중 6초 유휴 WebSocket 유지
 - sish 서버 재시작 뒤 클라이언트의 재등록
@@ -180,5 +202,11 @@ macOS arm64에서 공식 sish v2.23.0과 실제 sh 진입점으로 통합 테스
 - 처음 시작할 때 필요한 키 디렉터리 생성
 
 VPS 배포와 공인 인증서 발급, 서비스 Docker 이미지 빌드·실행 및 `autossh`의 자동 재접속은 이 로컬 테스트에 포함하지 않는다. 실제 서비스의 처리 성능이 기존보다 좋은지는 측정하지 않았다.
+
+설치 스크립트는 `tests/test_install.py`에서 실제 `sh install.sh` 진입점과 설정 파서를 사용해 별도로 검증한다. 권한·패키지·방화벽 명령은 임시 디렉터리의 대체 명령으로 실행하므로 현재 컴퓨터의 방화벽이나 패키지를 변경하지 않는다. 기본/사용자 지정 포트, 환경변수 우선순위, 재설치, UFW 비활성 상태, firewalld의 현재/영구 규칙과 zone, 패키지 자동 설치, 실패 종료 및 Linux 외 환경을 확인한다. 이 검증은 실제 Linux 방화벽에서 외부 접속이 가능한지 확인하는 테스트를 대신하지 않는다.
+
+```sh
+python3 -m unittest discover -s tests -p test_install.py -v
+```
 
 참고: [sish v2.23.0](https://github.com/antoniomika/sish/releases/tag/v2.23.0), [HTTP 포워딩](https://docs.ssi.sh/forwarding-types#http), [CLI 옵션](https://docs.ssi.sh/cli).
