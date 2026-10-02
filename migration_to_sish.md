@@ -58,6 +58,7 @@ VPS에는 기존처럼 Python 3(3.8 이상)를 사용한다. 추가 Python 패�
 ```text
 tunnel/v2_tunnel/
 ├── run_server.sh       # POSIX sh 진입점
+├── install.sh          # 바이너리 준비·Linux의 낮은 포트 바인딩 권한 부여
 ├── server.py           # 백그라운드 실행·시작 확인·정지·재시작·watchdog
 ├── config.py           # .env와 환경변수에서 sish 옵션 구성
 ├── install_sish.py     # 공식 바이너리 다운로드·SHA256 검증
@@ -95,7 +96,7 @@ SISH_SSH_PORT=2222
 
 ```sh
 sh run_server.sh check
-sh run_server.sh install  # 선택: 기존 서버를 내리기 전에 다운로드·검증
+sh install.sh            # 다운로드·검증, Linux에서는 낮은 포트 바인딩 권한 부여
 ../run_server.sh stop     # 기존 Caddy의 80/443 해제
 sh run_server.sh
 sh run_server.sh status
@@ -103,7 +104,7 @@ sh run_server.sh status
 
 첫 시작 시 Linux/macOS의 amd64·arm64를 구분해 공식 릴리스를 내려받고 체크섬을 검증한다. 이후에는 저장된 바이너리를 직접 실행한다. 기본 실행은 터미널과 분리되며, 시작 준비를 확인한 뒤 반환한다. `stop`, `restart`, `logs`, `--foreground`도 같은 sh 진입점으로 사용할 수 있다.
 
-Linux의 낮은 포트 바인딩 권한이 필요하면 sish에 해당 권한을 부여하거나 `sudo sh run_server.sh`로 실행한다. 시작·상태 확인·종료는 같은 사용자와 권한으로 실행한다.
+기존 Caddy 설치 스크립트처럼 Linux의 `sh install.sh`는 sish에 `CAP_NET_BIND_SERVICE`를 부여한다. 이 단계에서만 `sudo` 인증이 필요하며, 이후에는 같은 일반 사용자로 `sh run_server.sh`를 실행한다. 실행 파일 교체 후에는 설치 단계를 다시 수행한다. 권한이 없으면 시작 전 검사에서 오류와 설치 안내를 바로 표시한다.
 
 ### 도메인 등록과 HTTPS
 

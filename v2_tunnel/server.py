@@ -46,7 +46,17 @@ def lock_file(path, blocking=True):
         yield
 
 
-def free_ports(settings):
+def has_bind_capability(binary):
+    try:
+        data = os.getxattr(binary, "security.capability")
+    except (AttributeError, OSError):
+        return False
+    # Linux file capabilities: effective flag and permitted CAP_NET_BIND_SERVICE.
+    return bool(len(data) >= 12 and int.from_bytes(data[:4], "little") & 1
+                and int.from_bytes(data[4:8], "little") & (1 << 10))
+
+
+def free_ports(settings, binary):
     family = socket.AF_INET6 if ":" in settings.bind else socket.AF_INET
     for port in (settings.http, settings.https, settings.ssh):
         try:
@@ -54,9 +64,13 @@ def free_ports(settings):
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind((settings.bind, port))
         except PermissionError:
-            # sish may have CAP_NET_BIND_SERVICE even when Python cannot bind.
-            # Its actual startup/readiness check determines whether it can run.
-            continue
+            if sys.platform == "linux" and has_bind_capability(binary):
+                # The sish executable can bind even when Python cannot.
+                continue
+            raise ValueError(
+                "Permission denied while binding port {}. On Linux, run 'sh install.sh' "
+                "once to grant sish CAP_NET_BIND_SERVICE, then run 'sh run_server.sh'."
+                .format(port)) from None
         except OSError as error:
             raise ValueError("Port {} is unavailable: {}. Stop the existing server first.".format(port, error)) from None
 
@@ -227,25 +241,44 @@ def start(settings):
         print(json.dumps(result, indent=2))
         return 0 if result["ready"] else 1
     settings.validate()
-    ensure_binary(settings)
-    free_ports(settings)
+    print("Preparing the sish executable...", flush=True)
+    binary = ensure_binary(settings)
+    free_ports(settings, binary)
+    print("Starting sish: HTTP {}, HTTPS {}, SSH {}...".format(
+        settings.http, settings.https, settings.ssh), flush=True)
+    print("Log: {}".format(settings.runtime / "server.log"), flush=True)
     process = subprocess.Popen(
         [sys.executable, str(ROOT / "server.py"), "--supervise"], cwd=ROOT,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    deadline = time.monotonic() + settings.start_timeout
+    started = time.monotonic()
+    deadline = started + settings.start_timeout
+    next_progress = started + 5
+    last_status = None
     while time.monotonic() < deadline:
         result = control(settings, "status")
+        if result:
+            last_status = result
         if result and result["ready"]:
             print("sish is ready: HTTP {}, HTTPS {}, SSH {} (pid={})".format(
-                settings.http, settings.https, settings.ssh, result["sish_pid"]))
-            print("Log: {}".format(result["log"]))
+                settings.http, settings.https, settings.ssh, result["sish_pid"]), flush=True)
             return 0
         if process.poll() is not None:
             break
+        now = time.monotonic()
+        if now >= next_progress:
+            detail = result["error"] if result else "waiting for the supervisor"
+            print("Waiting for sish ({:.0f}/{:g}s): {}".format(
+                now - started, settings.start_timeout, detail), flush=True)
+            next_progress = now + 5
         time.sleep(0.1)
     # A failed launch must not leave a silently retrying background server.
+    if last_status and last_status["error"]:
+        print("Last startup status: {}".format(last_status["error"]), file=sys.stderr, flush=True)
+    elif process.poll() is not None:
+        print("The supervisor exited before sish was ready (exit code {}).".format(
+            process.returncode), file=sys.stderr, flush=True)
     stop(settings)
     print("sish failed its startup check. See {}.".format(settings.runtime / "server.log"), file=sys.stderr)
     return 1
@@ -284,10 +317,10 @@ def main():
             return 0
         if args.foreground:
             settings.validate()
-            ensure_binary(settings)
+            binary = ensure_binary(settings)
             if control(settings, "status"):
                 raise ValueError("The sish server is already running.")
-            free_ports(settings)
+            free_ports(settings, binary)
             # The lifetime lock belongs to Supervisor. Holding command.lock
             # here would prevent a separate stop/restart command from running.
             Supervisor(settings, foreground=True).run()

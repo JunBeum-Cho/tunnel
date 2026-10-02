@@ -41,7 +41,7 @@ SISH_CERTIFICATE_EMAIL=
 
 ```sh
 sh run_server.sh check
-sh run_server.sh install  # 선택 사항: 기존 서버를 내리기 전에 바이너리 준비
+sh install.sh  # 바이너리 준비, Linux에서는 80/443 바인딩 권한 부여
 ```
 
 기본 `80/443`은 기존 Caddy와 공유할 수 없으므로, 실제 도메인으로 시험할 때는 기존 터널 서버를 종료한 다음 새 서버를 시작한다. 이 전환 중에는 서비스 연결이 끊기는 시간이 발생한다.
@@ -54,9 +54,13 @@ sh run_server.sh status
 
 VPS 방화벽에서 외부 HTTP/HTTPS용 `80/443`과 서비스 Docker의 연결용 TCP `2222`가 열려 있어야 한다. 서비스 도메인의 DNS는 이 VPS를 가리켜야 한다. 기존 도메인을 그대로 사용한다면 DNS를 바꿀 필요는 없다.
 
-Linux에서 일반 사용자의 `80/443` 바인딩을 제한한다면 sish에 해당 권한을 부여하거나 `sudo sh run_server.sh`로 실행한다. 시작·상태 확인·종료는 같은 사용자와 권한으로 실행한다. 높은 포트의 로컬 테스트에는 root 권한이 필요 없다.
+기존 Caddy의 `install.sh`처럼, Linux에서는 `sh install.sh`가 sish 실행 파일에 `CAP_NET_BIND_SERVICE`를 부여한다. 일반 사용자로 실행하면 이 단계에서만 `sudo` 인증이 필요하며, 이후 시작·상태 확인·종료는 같은 일반 사용자로 `sh run_server.sh`를 사용한다. `setcap`이 없다면 Debian/Ubuntu에서 `sudo apt-get install libcap2-bin`으로 설치한다. 실행 파일을 교체하거나 새 버전으로 업데이트하면 새 실행 파일에도 이 설치 단계를 다시 수행한다. 높은 포트의 로컬 테스트에는 권한 부여 없이 `sh run_server.sh install`만 사용해도 된다.
+
+`bind: permission denied`가 나타나면 `sh run_server.sh stop`, `sh install.sh`, `sh run_server.sh` 순서로 실행한다. 실행 전에 바인딩 권한이 없다고 확인되면 즉시 실패 메시지를 표시하며, 시작 제한 시간 동안 재시작을 반복하지 않는다.
 
 `sh run_server.sh`는 sish와 관리 프로세스를 백그라운드로 실행하고 HTTP 응답, HTTPS 포트 연결, SSH 배너를 확인한 뒤 반환한다. SSH 세션이나 실행한 터미널을 닫아도 계속 실행된다. 이 확인은 앱의 응답이나 HTTPS 인증서 발급 완료까지 보장하지 않는다.
+
+시작할 때 바이너리 준비·시작 메시지와 로그 경로를 출력한다. 준비 확인이 길어지면 5초 간격으로 진행 상태를 출력하며, 기본 시작 확인 제한 시간은 30초다. 성공하면 `sish is ready`를 표시하고, 확인에 실패하면 마지막 상태와 로그 경로를 표시한다. 다른 터미널에서 `sh run_server.sh status`와 `sh run_server.sh logs`로도 확인할 수 있다.
 
 이미 실행 중일 때 같은 명령을 다시 실행하면 기존 프로세스와 서비스 연결을 유지한다. 사용 중인 포트에는 새 서버를 시작하지 않는다. 시작 확인에 실패하면 이번에 시작한 백그라운드 프로세스도 정리하고 실패를 반환한다.
 
@@ -111,7 +115,8 @@ sh run_server.sh logs        # 최근 로그 및 이후 로그, Ctrl+C로 보기
 sh run_server.sh restart     # 서버 재시작, SSH 연결은 재연결 필요
 sh run_server.sh stop        # 정지, 인증서와 서버 키는 보관
 sh run_server.sh check       # 설정 확인, 다운로드나 서버 실행은 하지 않음
-sh run_server.sh install     # 공식 바이너리 준비, 서버 실행은 하지 않음
+sh run_server.sh install     # 공식 바이너리만 준비, 서버 실행은 하지 않음
+sh install.sh               # 바이너리 준비와 Linux 낮은 포트 권한 부여
 sh run_server.sh --foreground
 ```
 
