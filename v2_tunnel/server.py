@@ -58,7 +58,7 @@ def free_ports(settings):
             # Its actual startup/readiness check determines whether it can run.
             continue
         except OSError as error:
-            raise ValueError("포트 {}를 사용할 수 없습니다: {}. 기존 서버를 먼저 종료하세요.".format(port, error)) from None
+            raise ValueError("Port {} is unavailable: {}. Stop the existing server first.".format(port, error)) from None
 
 
 class Supervisor:
@@ -203,7 +203,7 @@ class Supervisor:
 
 def stop(settings):
     if control(settings, "status") is None:
-        print("sish 서버가 실행 중이지 않습니다.")
+        print("The sish server is not running.")
         return 0
     control(settings, "stop")
     deadline = time.monotonic() + 15
@@ -212,12 +212,12 @@ def stop(settings):
             # The lifetime lock closes after the listener and child have stopped.
             try:
                 with lock_file(settings.runtime / "server.lock", blocking=False):
-                    print("sish 서버를 종료했습니다.")
+                    print("The sish server has stopped.")
                     return 0
             except BlockingIOError:
                 pass
         time.sleep(0.1)
-    print("sish 종료가 지연되고 있습니다. 로그를 확인하세요.", file=sys.stderr)
+    print("sish is taking too long to stop. Check the logs.", file=sys.stderr)
     return 1
 
 
@@ -238,7 +238,7 @@ def start(settings):
     while time.monotonic() < deadline:
         result = control(settings, "status")
         if result and result["ready"]:
-            print("sish 준비 완료: HTTP {}, HTTPS {}, SSH {} (pid={})".format(
+            print("sish is ready: HTTP {}, HTTPS {}, SSH {} (pid={})".format(
                 settings.http, settings.https, settings.ssh, result["sish_pid"]))
             print("Log: {}".format(result["log"]))
             return 0
@@ -247,7 +247,7 @@ def start(settings):
         time.sleep(0.1)
     # A failed launch must not leave a silently retrying background server.
     stop(settings)
-    print("sish 시작 확인 실패. {}를 확인하세요.".format(settings.runtime / "server.log"), file=sys.stderr)
+    print("sish failed its startup check. See {}.".format(settings.runtime / "server.log"), file=sys.stderr)
     return 1
 
 
@@ -265,17 +265,17 @@ def main():
             settings.validate()
             if not settings.binary:
                 release_name()
-            print("sish 설정이 유효합니다. Docker 없이 직접 실행합니다.")
+            print("sish configuration is valid. Runs directly without Docker.")
             return 0
         settings.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         if args.command == "status":
             result = control(settings, "status")
-            print(json.dumps(result, indent=2) if result else "sish 서버가 실행 중이지 않습니다.")
+            print(json.dumps(result, indent=2) if result else "The sish server is not running.")
             return 0 if result and result["ready"] else 1
         if args.command == "logs":
             path = settings.runtime / "server.log"
             if not path.exists():
-                print("아직 서버 로그가 없습니다.")
+                print("No server logs yet.")
                 return 0
             os.execvp("tail", ["tail", "-n", "100", "-F", str(path)])
         if args.supervise:
@@ -286,7 +286,7 @@ def main():
             settings.validate()
             ensure_binary(settings)
             if control(settings, "status"):
-                raise ValueError("sish 서버가 이미 실행 중입니다.")
+                raise ValueError("The sish server is already running.")
             free_ports(settings)
             # The lifetime lock belongs to Supervisor. Holding command.lock
             # here would prevent a separate stop/restart command from running.
@@ -299,11 +299,11 @@ def main():
                     return code
             if args.command == "install":
                 settings.validate()
-                print("sish 실행 파일: {}".format(ensure_binary(settings)))
+                print("sish executable: {}".format(ensure_binary(settings)))
                 return 0
             return start(settings)
     except (OSError, ValueError) as error:
-        print("sish 실행 실패: {}".format(error), file=sys.stderr)
+        print("sish execution failed: {}".format(error), file=sys.stderr)
         return 1
 
 

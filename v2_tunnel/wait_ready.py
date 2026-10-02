@@ -54,17 +54,16 @@ def main():
     while time.monotonic() < deadline:
         try:
             probe(*addresses)
-            print("sish 준비 완료: HTTP {}, HTTPS {}, SSH {}".format(
+            print("sish is ready: HTTP {}, HTTPS {}, SSH {}".format(
                 addresses[0][1], addresses[1][1], addresses[2][1],
             ))
             return 0
         except (OSError, http.client.HTTPException) as failure:
             error = failure
             time.sleep(0.25)
-    print("sish 시작 확인 실패: {}. ./run_server.sh logs로 확인하세요.".format(error), file=sys.stderr)
+    print("sish failed its startup check: {}. Run 'sh run_server.sh logs' for details.".format(error), file=sys.stderr)
     return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
