@@ -1,8 +1,7 @@
 """Real sish/SSH/HTTPS checks on isolated loopback ports, without ACME or a VPS.
 
-Set SISH_TEST_BIN to an extracted official sish binary and optionally set
-SISH_TEST_COMPOSE_BIN to a standalone Docker Compose binary. Otherwise the
-installed `docker compose` is used to resolve the production configuration.
+Set SISH_TEST_BIN to an official sish binary. All tests run the actual
+`sh run_server.sh` entry point; no Docker, Compose, ACME or VPS is involved.
 """
 
 import base64
@@ -13,6 +12,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -101,20 +101,8 @@ class SishIntegrationTests(unittest.TestCase):
         for executable in ("ssh", "openssl"):
             if not shutil.which(executable):
                 raise unittest.SkipTest("{} is required".format(executable))
-        standalone = os.environ.get("SISH_TEST_COMPOSE_BIN")
-        if standalone:
-            compose = [standalone]
-        elif shutil.which("docker"):
-            compose = ["docker", "compose"]
-        else:
-            raise unittest.SkipTest("Docker Compose is required to resolve compose.yml")
-        env = dict(os.environ, SSH_PASSWORD="integration-config-only")
-        result = subprocess.run(
-            compose + ["-f", str(ROOT / "compose.yml"), "config", "--format", "json"],
-            cwd=ROOT, env=env, capture_output=True, text=True, check=True,
-        )
-        config = json.loads(result.stdout)
-        cls.production_flags = config["services"]["sish"]["command"]
+        if not cls.binary.is_file():
+            raise ValueError("SISH_TEST_BIN must point to an official sish binary")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="sish-v2-test-", dir="/tmp")
@@ -148,25 +136,17 @@ class SishIntegrationTests(unittest.TestCase):
         self.start_gateway()
 
     def start_gateway(self):
-        flags = dict(flag[2:].split("=", 1) for flag in self.production_flags)
-        flags.update({
-            "http-address": "127.0.0.1:{}".format(self.http),
-            "https-address": "127.0.0.1:{}".format(self.https),
-            "ssh-address": "127.0.0.1:{}".format(self.ssh),
-            "domain": "example.test",
-            "authentication-password": self.password,
-            "authentication-keys-directory": str(self.directory / "pubkeys"),
-            "private-keys-directory": str(self.directory / "keys"),
-            "https-certificate-directory": str(self.directory / "ssl"),
-            "https-ondemand-certificate": "false",
-            "https-port-override": str(self.https),
-            "verify-dns": "false",
-        })
+        self.env = dict(os.environ, SSH_PASSWORD=self.password, SISH_BINARY=str(self.binary),
+                        SISH_RUNTIME_DIR=str(self.directory), SISH_BIND_ADDRESS="127.0.0.1",
+                        SISH_DOMAIN="example.test", SISH_HTTP_PORT=str(self.http),
+                        SISH_HTTPS_PORT=str(self.https), SISH_SSH_PORT=str(self.ssh),
+                        SISH_HTTPS_ONDEMAND="false", SISH_VERIFY_DNS="false",
+                        SISH_HEALTH_INTERVAL="0.3", SISH_HEALTH_FAILURES="2", SISH_START_TIMEOUT="10")
         log = (self.directory / "sish-{}.log".format(len(self.logs))).open("w+")
         self.logs.append(log)
         self.gateway = subprocess.Popen(
-            [str(self.binary)] + ["--{}={}".format(key, value) for key, value in flags.items()],
-            cwd=self.binary.parent, env=dict(os.environ, TMPDIR=str(self.directory)),
+            ["sh", str(ROOT / "run_server.sh"), "--foreground"],
+            cwd=ROOT, env=self.env,
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
         )
         self.processes.append(self.gateway)
@@ -179,8 +159,18 @@ class SishIntegrationTests(unittest.TestCase):
         if result.returncode:
             log.seek(0)
             self.fail(result.stderr + log.read().replace(self.password, "[password]"))
+        wait_until(lambda: self.status())
+
+    def command(self, *args):
+        return subprocess.run(["sh", str(ROOT / "run_server.sh"), *args],
+                              cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=25)
+
+    def status(self):
+        result = self.command("status")
+        return json.loads(result.stdout) if result.returncode == 0 else None
 
     def close(self):
+        self.command("stop")
         for process in reversed(self.processes):
             if process.poll() is None:
                 process.terminate()
@@ -329,6 +319,81 @@ class SishIntegrationTests(unittest.TestCase):
         self.start_gateway()
         self.assertEqual(self.request("first.example.test")[0], 404)
         self.forward("first.example.test", self.apps[0])
+        self.route_ready("first.example.test", "first")
+
+    def test_repeated_start_keeps_existing_process_and_live_tunnel(self):
+        self.forward("first.example.test", self.app("first"))
+        self.route_ready("first.example.test", "first")
+        before = self.status()
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.status()["sish_pid"], before["sish_pid"])
+        self.route_ready("first.example.test", "first")
+
+    def test_detached_start_restart_and_idempotent_stop_preserve_keys(self):
+        self.assertEqual(self.command("stop").returncode, 0)
+        self.gateway.wait(timeout=5)
+        keys = {path.name: path.read_bytes() for path in (self.directory / "keys").iterdir() if path.is_file()}
+        self.assertTrue(keys)
+        self.addCleanup(lambda: self.command("stop"))
+        started = self.command()
+        self.assertEqual(started.returncode, 0, started.stderr)
+        before = self.status()
+        self.assertTrue(before["ready"])
+        self.forward("first.example.test", self.app("first"))
+        self.route_ready("first.example.test", "first")
+        result = self.command("restart")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.status()["sish_pid"], before["sish_pid"])
+        self.assertEqual(self.request("first.example.test")[0], 404)
+        self.forward("first.example.test", self.apps[0])
+        self.route_ready("first.example.test", "first")
+        self.assertEqual(keys, {path.name: path.read_bytes() for path in (self.directory / "keys").iterdir() if path.is_file()})
+        self.assertEqual(self.command("stop").returncode, 0)
+        self.assertEqual(self.command("stop").returncode, 0)
+        self.assertIsNone(self.status())
+
+    def test_killed_sish_process_is_restarted(self):
+        before = self.status()
+        os.kill(before["sish_pid"], signal.SIGKILL)
+        def recovered():
+            current = self.status()
+            return current and current["sish_pid"] != before["sish_pid"] and current["restarts"] >= 1
+        wait_until(recovered, timeout=15)
+        self.assertEqual(self.request("first.example.test")[0], 404)
+
+    def test_unresponsive_sish_process_is_restarted(self):
+        before = self.status()
+        os.kill(before["sish_pid"], signal.SIGSTOP)
+        def recovered():
+            current = self.status()
+            return current and current["sish_pid"] != before["sish_pid"] and current["restarts"] >= 1
+        wait_until(recovered, timeout=20)
+        self.assertEqual(self.request("first.example.test")[0], 404)
+
+    def test_busy_port_fails_without_leaving_a_background_server(self):
+        self.assertEqual(self.command("stop").returncode, 0)
+        self.gateway.wait(timeout=5)
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", self.http))
+            listener.listen()
+            result = self.command()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(str(self.http), result.stderr)
+            self.assertIsNone(self.status())
+
+    def test_start_creates_missing_key_directories(self):
+        self.assertEqual(self.command("stop").returncode, 0)
+        self.gateway.wait(timeout=5)
+        for name in ("keys", "pubkeys"):
+            shutil.rmtree(self.directory / name)
+        self.addCleanup(lambda: self.command("stop"))
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.directory / "keys").is_dir())
+        self.assertTrue((self.directory / "pubkeys").is_dir())
+        self.forward("first.example.test", self.app("first"))
         self.route_ready("first.example.test", "first")
 
 
