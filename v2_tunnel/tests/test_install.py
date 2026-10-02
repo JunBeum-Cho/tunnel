@@ -5,6 +5,7 @@ package, capability and firewall commands are PATH stubs inside a temp directory
 no host firewall, privilege or package changes are made.
 """
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -36,7 +37,14 @@ if name == "uname":
 elif name == "id":
     print(os.environ.get("INSTALL_TEST_UID", "1000"))
 elif name == "sudo":
-    sys.exit(subprocess.run(args).returncode)
+    if Path(args[0]).name == "python3" and os.environ.get("INSTALL_TEST_ROOT_ACCESS"):
+        lock = Path(os.environ["INSTALL_TEST_ROOT_ACCESS"])
+        assert directory in lock.parents
+        # Emulate elevated access to this temp lock, without real root changes.
+        lock.chmod(0o600)
+    child_env = {key: value for key, value in os.environ.items()
+                 if not key.startswith("SISH_") and key != "SSH_PASSWORD"}
+    sys.exit(subprocess.run(args, env=child_env).returncode)
 elif name == "setcap":
     result = int(os.environ.get("INSTALL_TEST_SETCAP_FAIL", "0"))
 elif name == "apt-get":
@@ -47,11 +55,18 @@ elif name == "ufw":
     result = int(os.environ.get("INSTALL_TEST_UFW_FAIL", "0"))
     if result == 0 and args[0] == "allow":
         rules = state.setdefault("ufw", [])
-        if args[1] not in rules:
+        if args[1] not in rules and args[1] != os.environ.get("INSTALL_TEST_UFW_DROP_RULE"):
             rules.append(args[1])
         print("Rule added or already present")
     elif result == 0 and args[0] == "status":
-        print("Status: " + os.environ.get("INSTALL_TEST_UFW_STATUS", "active"))
+        status = os.environ.get("INSTALL_TEST_UFW_STATUS", "active")
+        print("Status: " + status)
+        if status == "active":
+            print("Default: deny (incoming), allow (outgoing), disabled (routed)")
+            print("To                         Action      From")
+            for port in state.get("ufw", []):
+                print(port + "                  ALLOW IN    Anywhere")
+                print(port + " (v6)             ALLOW IN    Anywhere (v6)")
 elif name == "firewall-cmd":
     if args == ["--state"]:
         result = 0 if os.environ.get("INSTALL_TEST_FIREWALLD", "running") == "running" else 252
@@ -136,13 +151,70 @@ class InstallerTests(unittest.TestCase):
 
     def test_ufw_default_ports_capability_and_repeat_install(self):
         self.add_command("ufw")
+        (self.directory / "state.json").write_text(json.dumps({"ufw": ["22/tcp", "80/tcp", "443/tcp"]}))
         result = self.run_installer()
         self.run_installer()
-        self.assertEqual(self.state()["ufw"], ["80/tcp", "443/tcp", "2222/tcp"])
+        self.assertEqual(self.state()["ufw"], ["22/tcp", "80/tcp", "443/tcp", "2222/tcp"])
         self.assertEqual(self.calls("setcap"), [["setcap", "cap_net_bind_service=+ep", str(self.binary)]] * 2)
         self.assertTrue(self.calls("sudo"))
         self.assertIn("Vultr Firewall Group", result.stdout)
+        self.assertIn("Verified active UFW inbound TCP rules for: 80 443 2222", result.stdout)
         self.assertFalse(any(call[1:] in (["enable"], ["reset"], ["disable"]) for call in self.calls("ufw")))
+
+    def test_missing_ufw_rule_after_successful_write_fails_before_binary_setup(self):
+        self.add_command("ufw")
+        self.env["INSTALL_TEST_UFW_DROP_RULE"] = "2222/tcp"
+        result = self.run_installer(success=False)
+        self.assertIn("UFW did not confirm an inbound v4 ALLOW rule for TCP 2222", result.stderr)
+        self.assertNotIn("Preparing the sish executable", result.stdout)
+        self.assertFalse(self.calls("setcap"))
+
+    def test_ipv6_ufw_rules_are_verified_for_ipv6_listen_address(self):
+        self.add_command("ufw")
+        self.write_config(bind="::")
+        result = self.run_installer()
+        self.assertIn("Verified active UFW inbound TCP rules", result.stdout)
+
+    def test_installation_does_not_open_a_running_servers_lifecycle_lock(self):
+        runtime = self.project / ".runtime"
+        runtime.mkdir(mode=0o700)
+        lock = runtime / "command.lock"
+        lock.write_text("existing server lock")
+        lock.chmod(0)
+        self.addCleanup(lock.chmod, 0o600)
+        self.add_command("ufw")
+        self.run_installer()
+        self.assertEqual(lock.stat().st_mode & 0o777, 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "This case requires an unprivileged test process")
+    def test_root_runtime_binary_preparation_retries_after_opening_firewall(self):
+        spec = importlib.util.spec_from_file_location("installer_binary_helper", ROOT / "install_sish.py")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        runtime = self.directory / "existing root runtime"
+        cached = runtime / "bin" / helper.release_name() / "sish"
+        cached.parent.mkdir(parents=True)
+        shutil.copyfile(self.binary, cached)
+        cached.chmod(0o700)
+        lock = runtime / "bin" / "install.lock"
+        lock.write_text("existing binary lock")
+        lock.chmod(0)
+        self.addCleanup(lock.chmod, 0o600)
+        self.env.update(SISH_RUNTIME_DIR=str(runtime), INSTALL_TEST_ROOT_ACCESS=str(lock))
+        config = self.project / ".env"
+        config.write_text("\n".join(line for line in config.read_text().splitlines()
+                                   if not line.startswith("SISH_BINARY=")) + "\n")
+        self.add_command("ufw")
+        result = self.run_installer()
+        self.assertIn("Retrying binary preparation with sudo", result.stdout)
+        self.assertIn("sish executable: " + str(cached), result.stdout)
+        calls = self.calls()
+        ufw_allow = next(i for i, call in enumerate(calls) if call[:2] == ["ufw", "allow"])
+        binary_root = next(i for i, call in enumerate(calls)
+                           if call[0] == "sudo" and Path(call[1]).name == "python3")
+        self.assertLess(ufw_allow, binary_root)
+        self.assertEqual(self.state()["ufw"], ["80/tcp", "443/tcp", "2222/tcp"])
+        self.assertEqual(self.calls("setcap"), [["setcap", "cap_net_bind_service=+ep", str(cached)]])
 
     def test_inactive_ufw_custom_ports_and_environment_precedence(self):
         self.add_command("ufw")

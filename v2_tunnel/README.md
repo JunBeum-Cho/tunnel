@@ -52,13 +52,15 @@ sh run_server.sh
 sh run_server.sh status
 ```
 
-`sh install.sh`는 `.env`와 환경변수에서 서버와 동일하게 포트를 읽고 Linux의 UFW 및 실행 중인 firewalld에 인바운드 TCP 허용 규칙을 추가한다. 기본값은 HTTP `80`, HTTPS `443`, 서비스 Docker 연결용 SSH `2222`이며, 포트를 바꿨다면 바뀐 값으로 설정한다. 다시 실행해도 같은 허용 규칙을 중복 추가하지 않는다. UFW가 비활성화돼 있으면 규칙만 저장하고 활성화 상태는 유지한다. firewalld는 활성 zone들과 기본 zone에 현재 적용 규칙과 영구 규칙을 모두 추가한다.
+`sh install.sh`는 `.env`와 환경변수에서 서버와 동일하게 포트를 읽고 Linux의 UFW 및 실행 중인 firewalld에 인바운드 TCP 허용 규칙을 추가한다. 기본값은 HTTP `80`, HTTPS `443`, 서비스 Docker 연결용 SSH `2222`이며, 포트를 바꿨다면 바뀐 값으로 설정한다. 설정 검증 후 방화벽을 먼저 처리하고 바이너리를 준비한다. 활성 UFW에서는 `ufw status verbose` 결과에 실제 허용 규칙이 반영됐는지도 검사한다. `2222/tcp` 등 필요한 규칙이 없으면 성공으로 표시하지 않고 설치를 실패로 종료한다. 다시 실행해도 같은 허용 규칙을 중복 추가하지 않는다. UFW가 비활성화돼 있으면 규칙만 저장하고 활성화 상태는 유지한다. firewalld는 활성 zone들과 기본 zone에 현재 적용 규칙과 영구 규칙을 모두 추가한다.
 
 UFW나 실행 중인 firewalld가 없는 경우에는 그 상태를 출력한다. 직접 구성한 nftables/iptables 규칙이 있다면 같은 포트를 허용해야 한다. **Vultr 계정에 연결된 Firewall Group은 VPS 내부 방화벽과 별도**이므로, 사용 중인 그룹에도 같은 TCP 포트의 인바운드 허용 규칙이 필요하다. 설치 마지막에 필요한 포트와 source 설정을 영어로 안내한다. IPv4 전체 접속을 허용할 때 source는 `0.0.0.0/0`이며, SSH 포트는 서비스 Docker 호스트의 공인 IP로 좁힐 수도 있다. IPv6로 접속한다면 해당 IPv6 규칙도 필요하다. [Vultr 방화벽 규칙](https://docs.vultr.com/products/network/firewall-groups/management/rules).
 
 서비스 도메인의 DNS는 이 VPS를 가리켜야 한다. 기존 도메인을 그대로 사용한다면 DNS를 바꿀 필요는 없다. 설치 출력에 listen 주소도 표시하며, loopback 주소를 지정했다면 외부 Docker가 연결할 수 없다는 안내를 출력한다. 운영용 기본값은 `SISH_BIND_ADDRESS=0.0.0.0`이다.
 
 기존 Caddy의 `install.sh`처럼, Linux에서는 `sh install.sh`가 sish 실행 파일에 `CAP_NET_BIND_SERVICE`를 부여한다. 일반 사용자로 실행하면 패키지·권한·방화벽 설정 단계에서 `sudo` 인증이 필요하며, 이후 시작·상태 확인·종료는 같은 일반 사용자로 `sh run_server.sh`를 사용한다. `setcap`이 없으면 Debian/Ubuntu의 `apt-get`으로 `libcap2-bin`을 자동 설치한다. 패키지 설치나 권한·방화벽 규칙 추가에 실패하면 설치 명령도 실패로 종료한다. 실행 파일을 교체하거나 새 버전으로 업데이트하면 새 실행 파일에도 이 설치 단계를 다시 수행한다. 높은 포트의 로컬 테스트에는 권한·방화벽 변경 없이 `sh run_server.sh install`만 사용해도 된다.
+
+기존 서버를 `sudo`로 실행해 `.runtime`이 root 권한으로 관리되고 있어도 설치의 방화벽 설정을 처리한다. 바이너리 준비에는 서버의 실행·종료 명령용 잠금을 사용하지 않고, 접근 권한이 필요한 경우 그 단계만 `sudo`로 재시도한다. 설정된 실행 파일·runtime 경로를 그대로 전달하며 인증 비밀번호를 명령행 인자로 전달하지 않는다. 실행 중인 서버의 키·로그·제어 소켓 소유권을 바꾸거나 설치 중 서버를 재시작하지 않는다. root로 시작했던 서버의 실행·정지·재시작에는 계속 같은 권한을 사용한다.
 
 `bind: permission denied`가 나타나면 `sh run_server.sh stop`, `sh install.sh`, `sh run_server.sh` 순서로 실행한다. 실행 전에 바인딩 권한이 없다고 확인되면 즉시 실패 메시지를 표시하며, 시작 제한 시간 동안 재시작을 반복하지 않는다.
 
@@ -67,6 +69,8 @@ UFW나 실행 중인 firewalld가 없는 경우에는 그 상태를 출력한다
 시작할 때 바이너리 준비·시작 메시지와 로그 경로를 출력한다. 준비 확인이 길어지면 5초 간격으로 진행 상태를 출력하며, 기본 시작 확인 제한 시간은 30초다. 성공하면 `sish is ready`를 표시하고, 확인에 실패하면 마지막 상태와 로그 경로를 표시한다. 다른 터미널에서 `sh run_server.sh status`와 `sh run_server.sh logs`로도 확인할 수 있다.
 
 이미 실행 중일 때 같은 명령을 다시 실행하면 기존 프로세스와 서비스 연결을 유지한다. 사용 중인 포트에는 새 서버를 시작하지 않는다. 시작 확인에 실패하면 이번에 시작한 백그라운드 프로세스도 정리하고 실패를 반환한다.
+
+`server.py`나 `wait_ready.py`를 VPS에 업데이트했다면 `sh run_server.sh restart`로 새 코드를 적용한다. `sh install.sh`와 기본 `sh run_server.sh`는 이미 실행 중인 관리 프로세스의 코드를 다시 읽지 않는다. 재시작하면 기존 SSH 연결이 끊겼다가 서비스의 `autossh`가 재연결한다. 기존 서버를 `sudo`로 실행했다면 정지·재시작도 동일한 권한으로 실행해야 한다.
 
 ## ourmemories Docker에서 연결하기
 
@@ -203,7 +207,7 @@ macOS arm64에서 공식 sish v2.23.0과 실제 sh 진입점으로 통합 테스
 
 VPS 배포와 공인 인증서 발급, 서비스 Docker 이미지 빌드·실행 및 `autossh`의 자동 재접속은 이 로컬 테스트에 포함하지 않는다. 실제 서비스의 처리 성능이 기존보다 좋은지는 측정하지 않았다.
 
-설치 스크립트는 `tests/test_install.py`에서 실제 `sh install.sh` 진입점과 설정 파서를 사용해 별도로 검증한다. 권한·패키지·방화벽 명령은 임시 디렉터리의 대체 명령으로 실행하므로 현재 컴퓨터의 방화벽이나 패키지를 변경하지 않는다. 기본/사용자 지정 포트, 환경변수 우선순위, 재설치, UFW 비활성 상태, firewalld의 현재/영구 규칙과 zone, 패키지 자동 설치, 실패 종료 및 Linux 외 환경을 확인한다. 이 검증은 실제 Linux 방화벽에서 외부 접속이 가능한지 확인하는 테스트를 대신하지 않는다.
+설치 스크립트는 `tests/test_install.py`에서 실제 `sh install.sh` 진입점과 설정 파서를 사용해 별도로 검증한다. 권한·패키지·방화벽 명령은 임시 디렉터리의 대체 명령으로 실행하므로 현재 컴퓨터의 방화벽이나 패키지를 변경하지 않는다. 기본/사용자 지정 포트, 환경변수 우선순위, 재설치, UFW 비활성 상태, 활성 UFW 규칙 확인과 누락 시 실패, IPv6 규칙, firewalld의 현재/영구 규칙과 zone, 접근이 제한된 기존 runtime에서 권한 재시도, 서버의 실행·종료 잠금과 독립된 설치, 패키지 자동 설치, 실패 종료 및 Linux 외 환경을 확인한다. 이 검증은 실제 Linux 방화벽에서 외부 접속이 가능한지 확인하는 테스트를 대신하지 않는다.
 
 ```sh
 python3 -m unittest discover -s tests -p test_install.py -v
