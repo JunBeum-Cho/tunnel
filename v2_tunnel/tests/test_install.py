@@ -1,8 +1,9 @@
 """Exercise the real installer with isolated Linux privilege/firewall commands.
 
 Uses the real configuration parser and binary preparation entry point. All root,
-package, capability and firewall commands are PATH stubs inside a temp directory;
-no host firewall, privilege or package changes are made.
+package, capability and firewall commands are stubs inside a temp directory.
+The installer's system sbin paths are redirected there for isolation; no host
+firewall, privilege or package changes are made.
 """
 
 import importlib.util
@@ -49,8 +50,9 @@ elif name == "setcap":
     result = int(os.environ.get("INSTALL_TEST_SETCAP_FAIL", "0"))
 elif name == "apt-get":
     result = int(os.environ.get("INSTALL_TEST_APT_FAIL", "0"))
-    if result == 0:
-        (Path(sys.argv[0]).parent / "setcap").symlink_to("dispatcher")
+    if result == 0 and not os.environ.get("INSTALL_TEST_APT_EXISTING"):
+        destination = Path(os.environ.get("INSTALL_TEST_SETCAP_DIR", str(Path(sys.argv[0]).parent)))
+        (destination / "setcap").symlink_to(Path(sys.argv[0]).parent / "dispatcher")
 elif name == "ufw":
     result = int(os.environ.get("INSTALL_TEST_UFW_FAIL", "0"))
     if result == 0 and args[0] == "allow":
@@ -104,6 +106,15 @@ class InstallerTests(unittest.TestCase):
         self.binary.chmod(0o700)
         self.bin = self.directory / "bin"
         self.bin.mkdir()
+        self.sbin = self.directory / "system sbin with spaces"
+        self.sbin.mkdir()
+        # Simulate the system's administrative directories without allowing the
+        # tests to discover or run real ufw/setcap/package commands on Linux.
+        installer = self.project / "install.sh"
+        installer_source = installer.read_text()
+        self.assertIn(":/usr/local/sbin:/usr/sbin:/sbin", installer_source)
+        installer.write_text(installer_source.replace(
+            ":/usr/local/sbin:/usr/sbin:/sbin", ":" + str(self.sbin)))
         dispatcher = self.bin / "dispatcher"
         dispatcher.write_text("#!{}\n".format(sys.executable) + STUB)
         dispatcher.chmod(0o700)
@@ -160,6 +171,28 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("Vultr Firewall Group", result.stdout)
         self.assertIn("Verified active UFW inbound TCP rules for: 80 443 2222", result.stdout)
         self.assertFalse(any(call[1:] in (["enable"], ["reset"], ["disable"]) for call in self.calls("ufw")))
+
+    def test_existing_admin_commands_are_found_outside_user_path(self):
+        self.add_command("apt-get")
+        self.env["INSTALL_TEST_APT_EXISTING"] = "1"
+        (self.bin / "setcap").unlink()
+        for command in ("ufw", "setcap"):
+            (self.sbin / command).symlink_to(self.bin / "dispatcher")
+            self.assertIsNone(shutil.which(command, path=self.env["PATH"]))
+        (self.directory / "state.json").write_text(json.dumps({"ufw": ["22/tcp", "80/tcp", "443/tcp"]}))
+        result = self.run_installer()
+        self.assertIn("Verified active UFW inbound TCP rules for: 80 443 2222", result.stdout)
+        self.assertEqual(self.state()["ufw"], ["22/tcp", "80/tcp", "443/tcp", "2222/tcp"])
+        self.assertEqual(self.calls("setcap"), [["setcap", "cap_net_bind_service=+ep", str(self.binary)]])
+        self.assertFalse(self.calls("apt-get"))
+
+    def test_newly_installed_setcap_is_found_in_sbin(self):
+        (self.bin / "setcap").unlink()
+        self.add_command("apt-get")
+        self.env["INSTALL_TEST_SETCAP_DIR"] = str(self.sbin)
+        self.run_installer()
+        self.assertEqual(self.calls("apt-get"), [["apt-get", "install", "-y", "libcap2-bin"]])
+        self.assertEqual(self.calls("setcap"), [["setcap", "cap_net_bind_service=+ep", str(self.binary)]])
 
     def test_missing_ufw_rule_after_successful_write_fails_before_binary_setup(self):
         self.add_command("ufw")

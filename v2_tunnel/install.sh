@@ -4,6 +4,10 @@ set -eu
 cd "$(dirname "$0")"
 LC_ALL=C
 export LC_ALL
+# Unprivileged Debian/Ubuntu shells may omit sbin even when ufw and setcap
+# are installed. Use the same administrative directories available to sudo.
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
+export PATH
 umask 077
 
 as_root() {

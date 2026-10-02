@@ -104,7 +104,7 @@ sh run_server.sh status
 
 첫 시작 시 Linux/macOS의 amd64·arm64를 구분해 공식 릴리스를 내려받고 체크섬을 검증한다. 이후에는 저장된 바이너리를 직접 실행한다. 기본 실행은 터미널과 분리되며, 시작 준비를 확인한 뒤 반환한다. `stop`, `restart`, `logs`, `--foreground`도 같은 sh 진입점으로 사용할 수 있다.
 
-기존 Caddy 설치 스크립트처럼 Linux의 `sh install.sh`는 sish에 `CAP_NET_BIND_SERVICE`를 부여한다. `setcap`이 없으면 Debian/Ubuntu에서 `libcap2-bin`을 자동 설치한다. 서버와 같은 설정 파서로 HTTP·HTTPS·SSH 포트를 읽어 UFW와 실행 중인 firewalld에 TCP 허용 규칙도 추가한다. 기본값은 `80/443/2222`이며 사용자 지정 포트도 반영된다. 반복 실행해도 규칙이 중복되지 않고, 비활성 UFW는 활성화 상태를 유지한다. firewalld의 활성 zone들과 기본 zone에는 현재 규칙과 영구 규칙을 함께 적용한다.
+기존 Caddy 설치 스크립트처럼 Linux의 `sh install.sh`는 sish에 `CAP_NET_BIND_SERVICE`를 부여한다. 일반 계정의 `PATH`에 빠져 있을 수 있는 `/usr/local/sbin`, `/usr/sbin`, `/sbin`까지 포함해 관리자 명령을 찾고, `setcap`이 실제로 없으면 Debian/Ubuntu에서 `libcap2-bin`을 자동 설치한다. 서버와 같은 설정 파서로 HTTP·HTTPS·SSH 포트를 읽어 UFW와 실행 중인 firewalld에 TCP 허용 규칙도 추가한다. 기본값은 `80/443/2222`이며 사용자 지정 포트도 반영된다. 반복 실행해도 규칙이 중복되지 않고, 비활성 UFW는 활성화 상태를 유지한다. firewalld의 활성 zone들과 기본 zone에는 현재 규칙과 영구 규칙을 함께 적용한다.
 
 설정 검증 후 방화벽 규칙을 바이너리 준비보다 먼저 적용한다. 활성 UFW는 실제 상태 출력에서 필요한 인바운드 허용 규칙을 확인하고, 빠진 규칙이 있으면 설치를 실패로 종료한다. root 권한으로 관리되는 기존 runtime 때문에 바이너리 준비에 접근 권한이 필요한 경우 그 단계만 `sudo`로 재시도한다. 서버의 실행·종료 잠금과 별개로 설치하므로 기존 관리 프로세스의 권한 때문에 방화벽 설정 단계가 실행되지 않는 일을 피한다.
 
