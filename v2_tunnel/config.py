@@ -118,5 +118,11 @@ class Settings:
             "https-ondemand-certificate-email": self.values.get("SISH_CERTIFICATE_EMAIL", ""),
             "idle-connection": "false",
             "verify-dns": self.verify_dns,
+            # v2.23.0 reads the entire request body even with consoles disabled
+            # unless this limit is zero. Keep uploads streaming for WebDAV and
+            # other services; this is a console capture limit, not a file limit.
+            "service-console-max-content-length": "0",
+            "service-console": "false",
+            "admin-console": "false",
         }
         return ["--{}={}".format(key, value) for key, value in flags.items()]

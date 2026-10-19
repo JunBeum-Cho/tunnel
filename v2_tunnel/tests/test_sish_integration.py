@@ -56,7 +56,18 @@ class App(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/ws":
+        if self.path == "/stream-download":
+            block = b"download-stream" * 4096
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(block) * 64))
+            self.end_headers()
+            self.wfile.write(block)
+            self.wfile.flush()
+            if not self.server.download_continue.wait(10):
+                return
+            for _ in range(63):
+                self.wfile.write(block)
+        elif self.path == "/ws":
             key = self.headers["Sec-WebSocket-Key"]
             accept = base64.b64encode(hashlib.sha1(
                 (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
@@ -89,6 +100,38 @@ class App(BaseHTTPRequestHandler):
             })
 
     def do_POST(self):
+        if self.path == "/stream-upload":
+            digest = hashlib.sha256()
+            size = 0
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                while True:
+                    length = int(self.rfile.readline().split(b";", 1)[0], 16)
+                    if not length:
+                        self.rfile.readline()
+                        break
+                    remaining = length
+                    while remaining:
+                        block = self.rfile.read(min(65536, remaining))
+                        if not block:
+                            return
+                        digest.update(block)
+                        size += len(block)
+                        remaining -= len(block)
+                        self.server.upload_first_chunk.set()
+                    if self.rfile.read(2) != b"\r\n":
+                        return
+            else:
+                remaining = int(self.headers["Content-Length"])
+                while remaining:
+                    block = self.rfile.read(min(65536, remaining))
+                    if not block:
+                        return
+                    digest.update(block)
+                    size += len(block)
+                    remaining -= len(block)
+                    self.server.upload_first_chunk.set()
+            self.reply({"size": size, "sha256": digest.hexdigest()})
+            return
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.reply({"size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
 
@@ -189,6 +232,8 @@ class SishIntegrationTests(unittest.TestCase):
         app = ThreadingHTTPServer(("127.0.0.1", 0), App)
         app.daemon_threads = True
         app.app_name = name
+        app.upload_first_chunk = threading.Event()
+        app.download_continue = threading.Event()
         threading.Thread(target=app.serve_forever, daemon=True).start()
         self.apps.append(app)
         return app
@@ -303,6 +348,69 @@ class SishIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(result), {"size": len(body), "sha256": hashlib.sha256(body).hexdigest()})
         self.assertEqual(self.request("first.example.test", "/slow")[0], 200)
+
+    def check_streaming_upload(self, chunked):
+        app = self.app("streaming")
+        self.forward("first.example.test", app)
+        self.route_ready("first.example.test", "streaming")
+        block = b"u" * 65536
+        connection = http.client.HTTPConnection("127.0.0.1", self.https, timeout=5)
+        connection.sock = self.tls_socket("first.example.test")
+        try:
+            connection.putrequest("POST", "/stream-upload", skip_host=True)
+            connection.putheader("Host", "first.example.test")
+            connection.putheader("Transfer-Encoding" if chunked else "Content-Length",
+                                 "chunked" if chunked else str(len(block) * 64))
+            connection.endheaders()
+
+            def send_block():
+                if chunked:
+                    connection.send(b"10000\r\n" + block + b"\r\n")
+                else:
+                    connection.send(block)
+
+            send_block()
+            # The producer deliberately stops here. ReadAll would deadlock
+            # until the whole request arrived instead of reaching the app.
+            self.assertTrue(app.upload_first_chunk.wait(3),
+                            "The proxy buffered the request before forwarding")
+            for _ in range(63):
+                send_block()
+            if chunked:
+                connection.send(b"0\r\n\r\n")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read()), {
+                "size": len(block) * 64,
+                "sha256": hashlib.sha256(block * 64).hexdigest(),
+            })
+        finally:
+            connection.close()
+
+    def test_upload_reaches_app_before_content_length_body_finishes(self):
+        self.check_streaming_upload(chunked=False)
+
+    def test_upload_reaches_app_before_chunked_body_finishes(self):
+        self.check_streaming_upload(chunked=True)
+
+    def test_download_reaches_client_before_app_finishes(self):
+        app = self.app("streaming")
+        self.forward("first.example.test", app)
+        self.route_ready("first.example.test", "streaming")
+        block = b"download-stream" * 4096
+        connection = http.client.HTTPConnection("127.0.0.1", self.https, timeout=3)
+        connection.sock = self.tls_socket("first.example.test")
+        connection.sock.settimeout(3)
+        try:
+            connection.request("GET", "/stream-download", headers={"Host": "first.example.test"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(len(block)), block)
+            app.download_continue.set()
+            self.assertEqual(response.read(), block * 63)
+        finally:
+            app.download_continue.set()
+            connection.close()
 
     def test_idle_websocket_survives_other_service_registration_and_cleanup(self):
         self.forward("first.example.test", self.app("first"))
